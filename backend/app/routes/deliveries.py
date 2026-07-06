@@ -1,5 +1,7 @@
 from datetime import date, datetime
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Query
 
 from app.database import get_db
@@ -62,35 +64,22 @@ def _session_data_from_docs(
     )
 
 
-async def _save_delivery_session(
-    db,
-    payload: DeliverySessionCreate,
+def _build_session_records(
+    *,
+    date_str: str,
+    customer_id: str,
+    session: str,
+    entries,
+    paid: bool,
+    paid_amount: float | None,
+    payment_note: str,
     rate_map: dict[tuple[str, str], float],
-) -> dict:
-    date_str = payload.date.isoformat()
-    session = payload.session
-    customer_id = payload.customer_id
-
-    await db.deliveries.delete_many(
-        {
-            "customer_id": customer_id,
-            "date": date_str,
-            "session": session,
-        }
-    )
-    await db.payments.delete_many(
-        {
-            "customer_id": customer_id,
-            "date": date_str,
-            "session": session,
-            "payment_type": "immediate",
-        }
-    )
-
-    delivery_docs = []
+    now: datetime,
+) -> tuple[list[dict], dict | None, float]:
+    delivery_docs: list[dict] = []
     session_total = 0.0
 
-    for entry in payload.entries:
+    for entry in entries:
         if entry.liters <= 0:
             continue
         combo = (entry.source, entry.milk_type)
@@ -115,35 +104,77 @@ async def _save_delivery_session(
                 "liters": entry.liters,
                 "rate": rate,
                 "amount": amount,
-                "created_at": datetime.utcnow(),
+                "created_at": now,
             }
         )
+
+    payment_doc = None
+    if paid and session_total > 0:
+        resolved_paid = paid_amount if paid_amount is not None else session_total
+        resolved_paid = min(resolved_paid, session_total)
+        if resolved_paid > 0:
+            payment_doc = {
+                "customer_id": customer_id,
+                "date": date_str,
+                "session": session,
+                "amount": resolved_paid,
+                "payment_type": "immediate",
+                "for_month": date_str[:7],
+                "note": payment_note or "Paid at delivery",
+                "created_at": now,
+            }
+
+    return delivery_docs, payment_doc, round(session_total, 2)
+
+
+async def _save_delivery_session(
+    db,
+    payload: DeliverySessionCreate,
+    rate_map: dict[tuple[str, str], float],
+) -> dict:
+    date_str = payload.date.isoformat()
+    session = payload.session
+    customer_id = payload.customer_id
+    now = datetime.utcnow()
+
+    delivery_docs, payment_doc, session_total = _build_session_records(
+        date_str=date_str,
+        customer_id=customer_id,
+        session=session,
+        entries=payload.entries,
+        paid=payload.paid,
+        paid_amount=payload.paid_amount,
+        payment_note=payload.payment_note,
+        rate_map=rate_map,
+        now=now,
+    )
+
+    await db.deliveries.delete_many(
+        {
+            "customer_id": customer_id,
+            "date": date_str,
+            "session": session,
+        }
+    )
+    await db.payments.delete_many(
+        {
+            "customer_id": customer_id,
+            "date": date_str,
+            "session": session,
+            "payment_type": "immediate",
+        }
+    )
 
     if delivery_docs:
         await db.deliveries.insert_many(delivery_docs)
 
     paid_amount = 0.0
-    if payload.paid and session_total > 0:
-        paid_amount = (
-            payload.paid_amount if payload.paid_amount is not None else session_total
-        )
-        paid_amount = min(paid_amount, session_total)
-        if paid_amount > 0:
-            await db.payments.insert_one(
-                {
-                    "customer_id": customer_id,
-                    "date": date_str,
-                    "session": session,
-                    "amount": paid_amount,
-                    "payment_type": "immediate",
-                    "for_month": date_str[:7],
-                    "note": payload.payment_note or "Paid at delivery",
-                    "created_at": datetime.utcnow(),
-                }
-            )
+    if payment_doc:
+        await db.payments.insert_one(payment_doc)
+        paid_amount = payment_doc["amount"]
 
     return {
-        "session_total": round(session_total, 2),
+        "session_total": session_total,
         "paid_amount": round(paid_amount, 2),
         "lines_saved": len(delivery_docs),
     }
@@ -201,45 +232,78 @@ async def save_delivery_day_bulk(payload: DeliveryDayBulkSave):
     if not payload.sessions:
         return DeliveryDayBulkSaveResponse(sessions_saved=0, total_amount=0)
 
+    date_str = payload.date.isoformat()
     rate_map = await _get_rate_map(db)
     customer_ids = {session.customer_id for session in payload.sessions}
-    active_ids: set[str] = set()
 
+    customer_oids = []
     for customer_id in customer_ids:
         try:
-            customer_oid = to_object_id(customer_id)
+            customer_oids.append(to_object_id(customer_id))
         except ValueError as exc:
             raise HTTPException(
                 status_code=400, detail=f"Invalid customer id: {customer_id}"
             ) from exc
 
-        customer = await db.customers.find_one(
-            {"_id": customer_oid, "is_active": True}
-        )
-        if not customer:
-            raise HTTPException(
-                status_code=404, detail=f"Customer not found: {customer_id}"
-            )
-        active_ids.add(customer_id)
+    active_customers = await db.customers.find(
+        {"_id": {"$in": customer_oids}, "is_active": True},
+        {"_id": 1},
+    ).to_list(len(customer_oids))
+    active_ids = {str(customer["_id"]) for customer in active_customers}
 
+    missing_ids = customer_ids - active_ids
+    if missing_ids:
+        missing = sorted(missing_ids)[0]
+        raise HTTPException(status_code=404, detail=f"Customer not found: {missing}")
+
+    now = datetime.utcnow()
+    all_delivery_docs: list[dict] = []
+    all_payment_docs: list[dict] = []
+    session_filters: list[dict] = []
     sessions_saved = 0
     total_amount = 0.0
 
     for item in payload.sessions:
         if item.customer_id not in active_ids:
             continue
-        session_payload = DeliverySessionCreate(
+
+        delivery_docs, payment_doc, session_total = _build_session_records(
+            date_str=date_str,
             customer_id=item.customer_id,
-            date=payload.date,
             session=item.session,
             entries=item.entries,
             paid=item.paid,
             paid_amount=item.paid_amount,
             payment_note=item.payment_note,
+            rate_map=rate_map,
+            now=now,
         )
-        result = await _save_delivery_session(db, session_payload, rate_map)
+
+        session_filters.append(
+            {"customer_id": item.customer_id, "session": item.session}
+        )
+        all_delivery_docs.extend(delivery_docs)
+        if payment_doc:
+            all_payment_docs.append(payment_doc)
         sessions_saved += 1
-        total_amount += result["session_total"]
+        total_amount += session_total
+
+    if session_filters:
+        await asyncio.gather(
+            db.deliveries.delete_many({"date": date_str, "$or": session_filters}),
+            db.payments.delete_many(
+                {
+                    "date": date_str,
+                    "payment_type": "immediate",
+                    "$or": session_filters,
+                }
+            ),
+        )
+
+        if all_delivery_docs:
+            await db.deliveries.insert_many(all_delivery_docs)
+        if all_payment_docs:
+            await db.payments.insert_many(all_payment_docs)
 
     return DeliveryDayBulkSaveResponse(
         sessions_saved=sessions_saved,
