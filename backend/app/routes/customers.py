@@ -1,4 +1,5 @@
-from datetime import date, datetime
+import asyncio
+from datetime import datetime
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
@@ -33,6 +34,52 @@ def _sort_customers(customers: list[dict], sort: CustomerSortType) -> list[dict]
         customers,
         key=lambda c: (_customer_entry_time(c), str(c["_id"])),
     )
+
+
+async def _bulk_customer_balances(
+    db, customer_ids: list[str]
+) -> dict[str, dict[str, float]]:
+    if not customer_ids:
+        return {}
+
+    delivery_pipeline = [
+        {"$match": {"customer_id": {"$in": customer_ids}}},
+        {"$group": {"_id": "$customer_id", "total": {"$sum": "$amount"}}},
+    ]
+    payment_pipeline = [
+        {"$match": {"customer_id": {"$in": customer_ids}}},
+        {"$group": {"_id": "$customer_id", "total": {"$sum": "$amount"}}},
+    ]
+
+    delivery_rows, payment_rows = await asyncio.gather(
+        db.deliveries.aggregate(delivery_pipeline).to_list(len(customer_ids)),
+        db.payments.aggregate(payment_pipeline).to_list(len(customer_ids)),
+    )
+
+    deliveries_map = {row["_id"]: row["total"] for row in delivery_rows}
+    payments_map = {row["_id"]: row["total"] for row in payment_rows}
+
+    balances: dict[str, dict[str, float]] = {}
+    for cid in customer_ids:
+        total_deliveries = deliveries_map.get(cid, 0)
+        total_payments = payments_map.get(cid, 0)
+        balances[cid] = {
+            "total_deliveries": round(total_deliveries, 2),
+            "total_payments": round(total_payments, 2),
+        }
+    return balances
+
+
+def _balance_from_totals(
+    opening_balance: float, totals: dict[str, float]
+) -> dict[str, float]:
+    total_deliveries = totals.get("total_deliveries", 0)
+    total_payments = totals.get("total_payments", 0)
+    return {
+        "balance": round(opening_balance + total_deliveries - total_payments, 2),
+        "total_deliveries": total_deliveries,
+        "total_payments": total_payments,
+    }
 
 
 async def _customer_balance(db, customer_id: ObjectId, opening_balance: float) -> dict:
@@ -98,13 +145,19 @@ async def list_customers(
     customers = await db.customers.find(query).to_list(500)
     customers = _sort_customers(customers, sort)
 
-    result = []
-    for customer in customers:
-        balance_info = await _customer_balance(
-            db, customer["_id"], customer.get("opening_balance", 0)
+    customer_ids = [str(customer["_id"]) for customer in customers]
+    balances = await _bulk_customer_balances(db, customer_ids)
+
+    return [
+        _format_customer(
+            customer,
+            _balance_from_totals(
+                customer.get("opening_balance", 0),
+                balances.get(str(customer["_id"]), {}),
+            ),
         )
-        result.append(_format_customer(customer, balance_info))
-    return result
+        for customer in customers
+    ]
 
 
 @router.post("", response_model=CustomerResponse, status_code=201)

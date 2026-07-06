@@ -10,6 +10,15 @@ async def connect_db() -> None:
     global client, db
     client = AsyncIOMotorClient(MONGODB_URL)
     db = client[DATABASE_NAME]
+    await ensure_indexes()
+
+
+async def ensure_indexes() -> None:
+    if db is None:
+        return
+    await db.customers.create_index("is_active")
+    await db.deliveries.create_index("customer_id")
+    await db.payments.create_index("customer_id")
 
 
 async def close_db() -> None:
