@@ -1,0 +1,22 @@
+# Python
+venv/
+backend/venv/
+backend/.env
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# MongoDB local data
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

@@ -1,0 +1,125 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cream-50: #fffdf7;
+  --color-cream-100: #fef9ec;
+  --color-cream-200: #fdf0d5;
+  --color-dairy-500: #2d6a4f;
+  --color-dairy-600: #1b4332;
+  --color-dairy-700: #081c15;
+  --color-accent-400: #f4a261;
+  --color-accent-500: #e76f51;
+  --font-sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: linear-gradient(180deg, #fffdf7 0%, #fef9ec 40%, #f8fafc 100%);
+  color: #1e293b;
+  -webkit-font-smoothing: antialiased;
+}
+
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+.card {
+  @apply rounded-2xl border border-white/60 bg-white/80 shadow-lg shadow-slate-200/50 backdrop-blur-sm transition-shadow duration-200;
+}
+
+.card:hover {
+  @apply shadow-xl shadow-slate-200/60;
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl bg-dairy-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-dairy-500 active:scale-[0.98] disabled:opacity-50;
+}
+
+.btn-secondary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 active:scale-[0.98];
+}
+
+.input-field {
+  @apply w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-dairy-500 focus:ring-2 focus:ring-dairy-500/20;
+}
+
+.label-text {
+  @apply text-sm font-medium text-slate-600;
+}
+
+.page-container {
+  @apply mx-auto w-full max-w-6xl px-4 pb-28 pt-4 sm:px-6 sm:pb-8 sm:pt-6 lg:px-8;
+}
+
+.page-container-wide {
+  @apply w-full max-w-none px-2 pb-28 pt-3 sm:px-3 sm:pb-8 sm:pt-4 lg:px-4;
+}
+
+.dropdown-panel {
+  @apply rounded-xl border border-slate-200 bg-white shadow-xl shadow-slate-200/60;
+}
+
+@keyframes dropdown-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-dropdown-in {
+  animation: dropdown-in 0.2s ease-out;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out;
+}
+
+/* Delivery table: soft row shadow — cell/input colors stay unchanged */
+.delivery-active-row {
+  position: relative;
+  z-index: 2;
+  filter:
+    drop-shadow(0 4px 14px rgba(45, 106, 79, 0.28))
+    drop-shadow(0 2px 6px rgba(45, 106, 79, 0.16));
+}
+
+@media print {
+  body {
+    background: white;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

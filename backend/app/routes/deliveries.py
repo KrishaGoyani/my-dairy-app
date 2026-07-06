@@ -1,0 +1,282 @@
+from datetime import date, datetime
+
+from bson import ObjectId
+from fastapi import APIRouter, HTTPException, Query
+
+from app.database import get_db
+from app.models.schemas import (
+    DayGroupResponse,
+    DeliveryLineResponse,
+    DeliverySessionCreate,
+    SessionSummary,
+)
+from app.utils import to_object_id
+
+router = APIRouter(prefix="/deliveries", tags=["deliveries"])
+
+VALID_COMBOS = {
+    ("batli", "M"),
+    ("cow", "G"),
+    ("potla", "M"),
+    ("potla", "G"),
+    ("potla", "B"),
+}
+
+
+async def _get_rate_map(db) -> dict[tuple[str, str], float]:
+    rates = await db.rates.find().to_list(20)
+    return {(r["source"], r["milk_type"]): r["rate"] for r in rates}
+
+
+def _month_range(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, month + 1, 1)
+    from datetime import timedelta
+
+    last_day = end - timedelta(days=1)
+    return start, last_day
+
+
+@router.post("/session", status_code=201)
+async def create_delivery_session(payload: DeliverySessionCreate):
+    db = get_db()
+    try:
+        customer_oid = to_object_id(payload.customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid customer id") from exc
+
+    customer = await db.customers.find_one({"_id": customer_oid, "is_active": True})
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    rate_map = await _get_rate_map(db)
+    date_str = payload.date.isoformat()
+    session = payload.session
+    customer_id = payload.customer_id
+
+    await db.deliveries.delete_many(
+        {
+            "customer_id": customer_id,
+            "date": date_str,
+            "session": session,
+        }
+    )
+    await db.payments.delete_many(
+        {
+            "customer_id": customer_id,
+            "date": date_str,
+            "session": session,
+            "payment_type": "immediate",
+        }
+    )
+
+    delivery_docs = []
+    session_total = 0.0
+
+    for entry in payload.entries:
+        if entry.liters <= 0:
+            continue
+        combo = (entry.source, entry.milk_type)
+        if combo not in VALID_COMBOS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid source/type combo: {entry.source}/{entry.milk_type}",
+            )
+        rate = rate_map.get(combo)
+        if rate is None:
+            raise HTTPException(status_code=400, detail="Rate not configured")
+
+        amount = round(entry.liters * rate, 2)
+        session_total += amount
+        delivery_docs.append(
+            {
+                "customer_id": customer_id,
+                "date": date_str,
+                "session": session,
+                "source": entry.source,
+                "milk_type": entry.milk_type,
+                "liters": entry.liters,
+                "rate": rate,
+                "amount": amount,
+                "created_at": datetime.utcnow(),
+            }
+        )
+
+    if delivery_docs:
+        await db.deliveries.insert_many(delivery_docs)
+
+    paid_amount = 0.0
+    if payload.paid and session_total > 0:
+        paid_amount = payload.paid_amount if payload.paid_amount is not None else session_total
+        paid_amount = min(paid_amount, session_total)
+        if paid_amount > 0:
+            await db.payments.insert_one(
+                {
+                    "customer_id": customer_id,
+                    "date": date_str,
+                    "session": session,
+                    "amount": paid_amount,
+                    "payment_type": "immediate",
+                    "for_month": date_str[:7],
+                    "note": payload.payment_note or "Paid at delivery",
+                    "created_at": datetime.utcnow(),
+                }
+            )
+
+    return {
+        "ok": True,
+        "session_total": round(session_total, 2),
+        "paid_amount": round(paid_amount, 2),
+        "lines_saved": len(delivery_docs),
+    }
+
+
+@router.get("/grouped", response_model=list[DayGroupResponse])
+async def get_grouped_deliveries(
+    customer_id: str = Query(...),
+    year: int = Query(...),
+    month: int = Query(..., ge=1, le=12),
+):
+    db = get_db()
+    start, end = _month_range(year, month)
+
+    deliveries = await db.deliveries.find(
+        {
+            "customer_id": customer_id,
+            "date": {
+                "$gte": start.isoformat(),
+                "$lte": end.isoformat(),
+            },
+        }
+    ).sort([("date", 1), ("session", 1)]).to_list(5000)
+
+    payments = await db.payments.find(
+        {
+            "customer_id": customer_id,
+            "payment_type": "immediate",
+            "date": {
+                "$gte": start.isoformat(),
+                "$lte": end.isoformat(),
+            },
+        }
+    ).to_list(5000)
+
+    payment_by_key = {
+        (p["date"], p.get("session")): p["amount"] for p in payments
+    }
+
+    days_map: dict[str, dict] = {}
+
+    for doc in deliveries:
+        day_key = doc["date"]
+        if day_key not in days_map:
+            days_map[day_key] = {
+                "date": date.fromisoformat(day_key),
+                "lines": [],
+                "sessions_map": {},
+            }
+
+        line = DeliveryLineResponse(
+            id=str(doc["_id"]),
+            customer_id=doc["customer_id"],
+            date=date.fromisoformat(doc["date"]),
+            session=doc["session"],
+            source=doc["source"],
+            milk_type=doc["milk_type"],
+            liters=doc["liters"],
+            rate=doc["rate"],
+            amount=doc["amount"],
+        )
+        days_map[day_key]["lines"].append(line)
+
+        sess_key = doc["session"]
+        if sess_key not in days_map[day_key]["sessions_map"]:
+            paid_amt = payment_by_key.get((day_key, sess_key), 0)
+            days_map[day_key]["sessions_map"][sess_key] = {
+                "session": sess_key,
+                "total_liters": 0,
+                "total_amount": 0,
+                "paid": paid_amt > 0,
+                "paid_amount": paid_amt,
+                "lines": [],
+            }
+
+        sm = days_map[day_key]["sessions_map"][sess_key]
+        sm["total_liters"] += doc["liters"]
+        sm["total_amount"] += doc["amount"]
+        sm["lines"].append(line)
+
+    result = []
+    for day_key in sorted(days_map.keys()):
+        day = days_map[day_key]
+        sessions = [
+            SessionSummary(
+                session=s["session"],
+                total_liters=round(s["total_liters"], 2),
+                total_amount=round(s["total_amount"], 2),
+                paid=s["paid"],
+                paid_amount=round(s["paid_amount"], 2),
+                lines=s["lines"],
+            )
+            for s in day["sessions_map"].values()
+        ]
+        total_liters = sum(l.liters for l in day["lines"])
+        total_amount = sum(l.amount for l in day["lines"])
+        paid_amount = sum(s.paid_amount for s in sessions)
+
+        result.append(
+            DayGroupResponse(
+                date=day["date"],
+                total_liters=round(total_liters, 2),
+                total_amount=round(total_amount, 2),
+                paid_amount=round(paid_amount, 2),
+                sessions=sessions,
+                lines=day["lines"],
+            )
+        )
+
+    return result
+
+
+@router.get("/session")
+async def get_session(
+    customer_id: str = Query(...),
+    date_value: date = Query(..., alias="date"),
+    session: str = Query(...),
+):
+    db = get_db()
+    date_str = date_value.isoformat()
+
+    lines = await db.deliveries.find(
+        {
+            "customer_id": customer_id,
+            "date": date_str,
+            "session": session,
+        }
+    ).to_list(20)
+
+    payment = await db.payments.find_one(
+        {
+            "customer_id": customer_id,
+            "date": date_str,
+            "session": session,
+            "payment_type": "immediate",
+        }
+    )
+
+    return {
+        "entries": [
+            {
+                "source": l["source"],
+                "milk_type": l["milk_type"],
+                "liters": l["liters"],
+            }
+            for l in lines
+        ],
+        "paid": payment is not None,
+        "paid_amount": payment["amount"] if payment else 0,
+        "session_total": round(sum(l["amount"] for l in lines), 2),
+    }
