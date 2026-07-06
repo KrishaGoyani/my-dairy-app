@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import Layout from '../components/Layout'
 import BillCard from '../components/BillCard'
+import BillExportCard from '../components/BillExportCard'
 import { PageHeader, LoadingSpinner, DatePicker, Select, CustomerSelect } from '../components/UI'
 import { useToast } from '../components/Toast'
 import {
@@ -73,7 +74,7 @@ function SessionSourceDetail({ session, rates }) {
 
 export default function Bills() {
   const [searchParams] = useSearchParams()
-  const cardRef = useRef(null)
+  const exportRef = useRef(null)
   const { showToast } = useToast()
 
   const now = new Date()
@@ -145,11 +146,11 @@ export default function Bills() {
   }
 
   const runExport = async (action) => {
-    if (!cardRef.current || !bill || exporting) return
+    if (!exportRef.current || !bill || exporting) return
     setExporting(true)
     try {
       const exporter = await exportBillCard({
-        element: cardRef.current,
+        element: exportRef.current,
         filenameBase: billFilenameBase(),
         customerPhone: selectedCustomer?.phone,
         billMessage: billMessage(),
@@ -310,7 +311,22 @@ export default function Bills() {
               </button>
             </div>
 
-            <BillCard bill={bill} cardRef={cardRef} rates={rates} />
+            <BillCard bill={bill} rates={rates} />
+
+            <div
+              aria-hidden="true"
+              style={{
+                position: 'fixed',
+                left: 0,
+                top: 0,
+                zIndex: -1,
+                opacity: 0,
+                pointerEvents: 'none',
+                overflow: 'visible',
+              }}
+            >
+              <BillExportCard ref={exportRef} bill={bill} rates={rates} />
+            </div>
 
             <div className="no-print mt-6 card p-4 sm:p-5">
               <h3 className="mb-4 font-bold text-slate-800">

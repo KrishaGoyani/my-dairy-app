@@ -160,10 +160,15 @@ export function downloadCanvasAsPng(canvas, filename) {
 
 export function downloadCanvasAsPdf(canvas, filename) {
   const imgData = canvas.toDataURL('image/png')
-  const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+  const isWide = canvas.width > canvas.height * 1.1
+  const pdf = new jsPDF({
+    orientation: isWide ? 'landscape' : 'portrait',
+    unit: 'mm',
+    format: 'a4',
+  })
   const pageWidth = pdf.internal.pageSize.getWidth()
   const pageHeight = pdf.internal.pageSize.getHeight()
-  const margin = 6
+  const margin = 5
   const printableWidth = pageWidth - margin * 2
   const printableHeight = pageHeight - margin * 2
 
@@ -177,15 +182,15 @@ export function downloadCanvasAsPdf(canvas, filename) {
   }
 
   let heightLeft = imgHeight
-  let yOffset = margin
+  let position = margin
 
-  pdf.addImage(imgData, 'PNG', margin, yOffset, imgWidth, imgHeight)
+  pdf.addImage(imgData, 'PNG', margin, position, imgWidth, imgHeight)
   heightLeft -= printableHeight
 
   while (heightLeft > 0) {
-    yOffset = margin - (imgHeight - heightLeft)
-    pdf.addPage()
-    pdf.addImage(imgData, 'PNG', margin, yOffset, imgWidth, imgHeight)
+    position = margin - (imgHeight - heightLeft)
+    pdf.addPage('a4', isWide ? 'landscape' : 'portrait')
+    pdf.addImage(imgData, 'PNG', margin, position, imgWidth, imgHeight)
     heightLeft -= printableHeight
   }
 
