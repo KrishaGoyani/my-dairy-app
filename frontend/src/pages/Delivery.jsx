@@ -8,8 +8,8 @@ import { useToast } from '../components/Toast'
 import {
   getCustomers,
   getRates,
-  getDeliverySession,
-  saveDeliverySession,
+  getDeliveryDay,
+  saveDeliveryDayBulk,
 } from '../api/client'
 import {
   SESSIONS,
@@ -108,35 +108,29 @@ export default function Delivery() {
   useEffect(() => {
     if (!customers.length) return
     setLoadingEntries(true)
-    Promise.all(
-      customers.flatMap((customer) =>
-        SESSIONS.map((session) =>
-          getDeliverySession(customer.id, date, session.id)
-            .then((res) => ({
-              customerId: customer.id,
-              session: session.id,
-              grid: fillGridFromEntries(res.data.entries),
-            }))
-            .catch(() => ({
-              customerId: customer.id,
-              session: session.id,
-              grid: null,
-            }))
-        )
-      )
-    )
-      .then((results) => {
+    getDeliveryDay(date)
+      .then((res) => {
         const next = initBulkGrids(customers)
         const loaded = new Set()
-        for (const row of results) {
-          if (row.grid !== null) {
-            loaded.add(`${row.customerId}-${row.session}`)
-            next[row.customerId][row.session] = row.grid
+        const dayData = res.data.customers || {}
+
+        for (const customer of customers) {
+          const customerData = dayData[customer.id]
+          if (!customerData) continue
+
+          for (const session of SESSIONS) {
+            const sessionData = customerData[session.id]
+            if (!sessionData) continue
+
+            loaded.add(`${customer.id}-${session.id}`)
+            next[customer.id][session.id] = fillGridFromEntries(sessionData.entries)
           }
         }
+
         setLoadedKeys(loaded)
         setBulkGrids(next)
       })
+      .catch(() => showToast(t('Failed to load entries', 'નોંધ લોડ ન થઈ'), 'error'))
       .finally(() => setLoadingEntries(false))
   }, [customers, date])
 
@@ -187,7 +181,7 @@ export default function Delivery() {
   const handleSave = async () => {
     setSaving(true)
     try {
-      const saves = customers.flatMap((customer) =>
+      const sessions = customers.flatMap((customer) =>
         SESSIONS.flatMap((session) => {
           const grid = bulkGrids[customer.id]?.[session.id]
           const entries = buildEntriesFromGrid(grid || emptyCustomerSessions()[session.id])
@@ -196,18 +190,21 @@ export default function Delivery() {
             return []
           }
           return [
-            saveDeliverySession({
+            {
               customer_id: customer.id,
-              date,
               session: session.id,
               entries,
               paid: false,
               paid_amount: null,
-            }),
+            },
           ]
         })
       )
-      await Promise.all(saves)
+
+      await saveDeliveryDayBulk({ date, sessions })
+      setLoadedKeys(
+        new Set(sessions.map((session) => `${session.customer_id}-${session.session}`))
+      )
       showToast(
         `${t('Saved', 'સેવ થયું')}! ${formatCurrency(grandTotal)}`,
         'success'

@@ -20,6 +20,8 @@ export const getDeliverySession = (customerId, date, session) =>
   api.get('/deliveries/session', {
     params: { customer_id: customerId, date, session },
   })
+export const getDeliveryDay = (date) => api.get('/deliveries/day', { params: { date } })
+export const saveDeliveryDayBulk = (data) => api.post('/deliveries/day/bulk', data)
 export const getGroupedDeliveries = (customerId, year, month) =>
   api.get('/deliveries/grouped', {
     params: { customer_id: customerId, year, month },

@@ -1,13 +1,17 @@
 from datetime import date, datetime
 
-from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
 
 from app.database import get_db
 from app.models.schemas import (
     DayGroupResponse,
+    DeliveryDayBulkSave,
+    DeliveryDayBulkSaveResponse,
+    DeliveryDayCustomerData,
+    DeliveryDayResponse,
     DeliveryLineResponse,
     DeliverySessionCreate,
+    DeliverySessionData,
     SessionSummary,
 )
 from app.utils import to_object_id
@@ -40,19 +44,29 @@ def _month_range(year: int, month: int) -> tuple[date, date]:
     return start, last_day
 
 
-@router.post("/session", status_code=201)
-async def create_delivery_session(payload: DeliverySessionCreate):
-    db = get_db()
-    try:
-        customer_oid = to_object_id(payload.customer_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid customer id") from exc
+def _session_data_from_docs(
+    lines: list[dict], payment: dict | None
+) -> DeliverySessionData:
+    return DeliverySessionData(
+        entries=[
+            {
+                "source": line["source"],
+                "milk_type": line["milk_type"],
+                "liters": line["liters"],
+            }
+            for line in lines
+        ],
+        paid=payment is not None,
+        paid_amount=payment["amount"] if payment else 0,
+        session_total=round(sum(line["amount"] for line in lines), 2),
+    )
 
-    customer = await db.customers.find_one({"_id": customer_oid, "is_active": True})
-    if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
 
-    rate_map = await _get_rate_map(db)
+async def _save_delivery_session(
+    db,
+    payload: DeliverySessionCreate,
+    rate_map: dict[tuple[str, str], float],
+) -> dict:
     date_str = payload.date.isoformat()
     session = payload.session
     customer_id = payload.customer_id
@@ -110,7 +124,9 @@ async def create_delivery_session(payload: DeliverySessionCreate):
 
     paid_amount = 0.0
     if payload.paid and session_total > 0:
-        paid_amount = payload.paid_amount if payload.paid_amount is not None else session_total
+        paid_amount = (
+            payload.paid_amount if payload.paid_amount is not None else session_total
+        )
         paid_amount = min(paid_amount, session_total)
         if paid_amount > 0:
             await db.payments.insert_one(
@@ -127,11 +143,125 @@ async def create_delivery_session(payload: DeliverySessionCreate):
             )
 
     return {
-        "ok": True,
         "session_total": round(session_total, 2),
         "paid_amount": round(paid_amount, 2),
         "lines_saved": len(delivery_docs),
     }
+
+
+@router.get("/day", response_model=DeliveryDayResponse)
+async def get_delivery_day(date_value: date = Query(..., alias="date")):
+    db = get_db()
+    date_str = date_value.isoformat()
+
+    deliveries = await db.deliveries.find({"date": date_str}).to_list(10000)
+    payments = await db.payments.find(
+        {"date": date_str, "payment_type": "immediate"}
+    ).to_list(5000)
+
+    lines_by_key: dict[tuple[str, str], list[dict]] = {}
+    for doc in deliveries:
+        key = (doc["customer_id"], doc["session"])
+        lines_by_key.setdefault(key, []).append(doc)
+
+    payment_by_key = {
+        (payment["customer_id"], payment.get("session")): payment
+        for payment in payments
+    }
+
+    customer_ids = {customer_id for customer_id, _ in lines_by_key}
+    customer_ids.update(customer_id for customer_id, _ in payment_by_key)
+
+    customers: dict[str, DeliveryDayCustomerData] = {}
+    for customer_id in customer_ids:
+        morning_key = (customer_id, "morning")
+        evening_key = (customer_id, "evening")
+        morning_lines = lines_by_key.get(morning_key, [])
+        evening_lines = lines_by_key.get(evening_key, [])
+        morning_payment = payment_by_key.get(morning_key)
+        evening_payment = payment_by_key.get(evening_key)
+
+        customer_data = DeliveryDayCustomerData()
+        if morning_lines or morning_payment:
+            customer_data.morning = _session_data_from_docs(
+                morning_lines, morning_payment
+            )
+        if evening_lines or evening_payment:
+            customer_data.evening = _session_data_from_docs(
+                evening_lines, evening_payment
+            )
+        customers[customer_id] = customer_data
+
+    return DeliveryDayResponse(customers=customers)
+
+
+@router.post("/day/bulk", response_model=DeliveryDayBulkSaveResponse, status_code=201)
+async def save_delivery_day_bulk(payload: DeliveryDayBulkSave):
+    db = get_db()
+    if not payload.sessions:
+        return DeliveryDayBulkSaveResponse(sessions_saved=0, total_amount=0)
+
+    rate_map = await _get_rate_map(db)
+    customer_ids = {session.customer_id for session in payload.sessions}
+    active_ids: set[str] = set()
+
+    for customer_id in customer_ids:
+        try:
+            customer_oid = to_object_id(customer_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid customer id: {customer_id}"
+            ) from exc
+
+        customer = await db.customers.find_one(
+            {"_id": customer_oid, "is_active": True}
+        )
+        if not customer:
+            raise HTTPException(
+                status_code=404, detail=f"Customer not found: {customer_id}"
+            )
+        active_ids.add(customer_id)
+
+    sessions_saved = 0
+    total_amount = 0.0
+
+    for item in payload.sessions:
+        if item.customer_id not in active_ids:
+            continue
+        session_payload = DeliverySessionCreate(
+            customer_id=item.customer_id,
+            date=payload.date,
+            session=item.session,
+            entries=item.entries,
+            paid=item.paid,
+            paid_amount=item.paid_amount,
+            payment_note=item.payment_note,
+        )
+        result = await _save_delivery_session(db, session_payload, rate_map)
+        sessions_saved += 1
+        total_amount += result["session_total"]
+
+    return DeliveryDayBulkSaveResponse(
+        sessions_saved=sessions_saved,
+        total_amount=round(total_amount, 2),
+    )
+
+
+@router.post("/session", status_code=201)
+async def create_delivery_session(payload: DeliverySessionCreate):
+    db = get_db()
+    try:
+        customer_oid = to_object_id(payload.customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid customer id") from exc
+
+    customer = await db.customers.find_one({"_id": customer_oid, "is_active": True})
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    rate_map = await _get_rate_map(db)
+    result = await _save_delivery_session(db, payload, rate_map)
+    return {"ok": True, **result}
 
 
 @router.get("/grouped", response_model=list[DayGroupResponse])
@@ -267,16 +397,5 @@ async def get_session(
         }
     )
 
-    return {
-        "entries": [
-            {
-                "source": l["source"],
-                "milk_type": l["milk_type"],
-                "liters": l["liters"],
-            }
-            for l in lines
-        ],
-        "paid": payment is not None,
-        "paid_amount": payment["amount"] if payment else 0,
-        "session_total": round(sum(l["amount"] for l in lines), 2),
-    }
+    session_data = _session_data_from_docs(lines, payment)
+    return session_data.model_dump()

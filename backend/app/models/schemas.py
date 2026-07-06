@@ -85,6 +85,42 @@ class DeliverySessionCreate(BaseModel):
     payment_note: str = ""
 
 
+class DeliverySessionData(BaseModel):
+    entries: list[DeliveryEntryInput]
+    paid: bool = False
+    paid_amount: float = 0
+    session_total: float = 0
+
+
+class DeliveryDayCustomerData(BaseModel):
+    morning: Optional[DeliverySessionData] = None
+    evening: Optional[DeliverySessionData] = None
+
+
+class DeliveryDayResponse(BaseModel):
+    customers: dict[str, DeliveryDayCustomerData]
+
+
+class DeliveryDayBulkItem(BaseModel):
+    customer_id: str
+    session: SessionType
+    entries: list[DeliveryEntryInput]
+    paid: bool = False
+    paid_amount: Optional[float] = Field(default=None, ge=0)
+    payment_note: str = ""
+
+
+class DeliveryDayBulkSave(BaseModel):
+    date: date
+    sessions: list[DeliveryDayBulkItem]
+
+
+class DeliveryDayBulkSaveResponse(BaseModel):
+    ok: bool = True
+    sessions_saved: int
+    total_amount: float
+
+
 class DeliveryLineResponse(BaseModel):
     id: str
     customer_id: str

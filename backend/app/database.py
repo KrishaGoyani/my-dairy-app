@@ -18,7 +18,9 @@ async def ensure_indexes() -> None:
         return
     await db.customers.create_index("is_active")
     await db.deliveries.create_index("customer_id")
+    await db.deliveries.create_index([("date", 1), ("customer_id", 1), ("session", 1)])
     await db.payments.create_index("customer_id")
+    await db.payments.create_index([("date", 1), ("customer_id", 1), ("session", 1)])
 
 
 async def close_db() -> None:
